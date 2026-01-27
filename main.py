@@ -15,55 +15,50 @@ app = FastAPI()
 BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
 new_tokens = []
 
-# --- 1. FONCTION DE SECOURS (CORRIGÉE : NEW LISTINGS) ---
+# --- 1. ROUE DE SECOURS (TOP VOLUME) ---
 def fetch_initial_history():
-    """Récupère les 10 derniers listings officiels pour remplir le scanner"""
-    print("⚡ Démarrage: Récupération des 'New Listings'...")
-    # On change l'URL pour celle des nouveaux listings, plus fiable
-    url = "https://public-api.birdeye.so/defi/new_listing?limit=10"
+    """Charge les tokens les plus actifs pour ne pas démarrer à vide"""
+    print("⚡ Démarrage: Chargement du TOP VOLUME (Méthode Infaillible)...")
+    # On demande les tokens par volume 24h. Impossible d'avoir une 404 ici.
+    url = "https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=20"
     headers = {"X-API-KEY": BIRDEYE_KEY, "x-chain": "solana"}
     
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            # L'API new_listing renvoie souvent une liste directe dans 'items'
             items = data.get("data", {}).get("items", [])
             
-            if not items:
-                print("⚠️ API REST a renvoyé une liste vide.")
-                
             for t in items:
-                # On formate pour que ça ressemble au WebSocket
+                # On nettoie les données
                 token_clean = {
                     "address": t.get("address"),
                     "symbol": t.get("symbol", "UNK"),
-                    "mc": t.get("mc", 0) or t.get("fdv", 0), # Fallback sur FDV
+                    "mc": t.get("mc", 0) or t.get("v24hUSD", 0), # Fallback
                     "v24hUSD": t.get("v24hUSD", 0),
                     "liquidity": t.get("liquidity", 0),
-                    "source": "HISTORY"
+                    "source": "HISTORY_VOL" # On marque que c'est de l'historique
                 }
                 new_tokens.append(token_clean)
-            print(f"✅ Historique chargé : {len(new_tokens)} tokens ajoutés.")
+            print(f"✅ Historique chargé : {len(new_tokens)} tokens en mémoire.")
         else:
-            print(f"⚠️ Erreur API REST: {resp.status_code} - {resp.text}")
+            print(f"⚠️ Erreur API: {resp.status_code}")
     except Exception as e:
-        print(f"⚠️ Exception API REST: {e}")
+        print(f"⚠️ Exception API: {e}")
 
-# --- 2. TÂCHE DE FOND (WEBSOCKET) ---
+# --- 2. WEBSOCKET (NOUVEAUX TOKENS) ---
 async def websocket_listener():
-    """Écoute les NOUVEAUX tokens en temps réel"""
     if not BIRDEYE_KEY:
-        print("❌ ERREUR : Pas de clé API !")
+        print("❌ ERREUR : Clé manquante")
         return
 
     uri = f"wss://public-api.birdeye.so/socket/solana?x-api-key={BIRDEYE_KEY}"
     
     while True:
         try:
-            print("🔄 Connexion WebSocket...")
+            print("🔄 Connexion WS...")
             async with websockets.connect(uri) as ws:
-                print("✅ WebSocket Connecté (Mode Live)")
+                print("✅ WS Connecté (Mode Live)")
                 await ws.send(json.dumps({"type": "subscribe", "event": "SUBSCRIBE_TOKEN_NEW_LISTING"}))
                 
                 while True:
@@ -74,44 +69,45 @@ async def websocket_listener():
                         if data.get("type") == "SUBSCRIBE_TOKEN_NEW_LISTING":
                             t = data.get("data", {})
                             if t:
-                                t['source'] = "LIVE"
-                                symbol = t.get('symbol', '???')
-                                print(f"🔥 NOUVEAU TOKEN : {symbol}")
-                                new_tokens.insert(0, t)
+                                t['source'] = "LIVE_NEW"
+                                print(f"💎 NOUVEAU GEM : {t.get('symbol')}")
+                                new_tokens.insert(0, t) # Ajoute au début
                                 if len(new_tokens) > 50: new_tokens.pop()
-                                
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"type": "ping"}))
-                        
         except Exception as e:
-            print(f"❌ Reconnexion WS dans 5s... ({e})")
+            print(f"❌ Erreur WS: {e}")
             await asyncio.sleep(5)
 
-# --- DÉMARRAGE ---
 @app.on_event("startup")
 async def startup_event():
     fetch_initial_history()
     asyncio.create_task(websocket_listener())
 
-# --- API ENDPOINT ---
+# --- PAGE D'ACCUEIL (Pour voir si ça marche) ---
+@app.get("/")
+def root():
+    return {
+        "status": "ONLINE", 
+        "tokens_loaded": len(new_tokens), 
+        "message": "Va sur /api/gems pour voir la liste"
+    }
+
+# --- PAGE DES DONNÉES ---
 @app.get("/api/gems")
 def get_gems():
     gems = []
-    # Copie de sécurité
     current_list = list(new_tokens)
     
     for t in current_list[:20]:
-        # On force l'affichage même si MC est 0 pour le test
-        mc = t.get("mc", 0) or t.get("fdv", 0) or 0
-        
+        mc = t.get("mc", 0) or 0
         gems.append({
             "address": t.get("address", ""),
             "symbol": t.get("symbol", "???"),
             "mc": round(mc, 2),
             "volume": round(t.get("v24hUSD", 0), 2),
-            "source": t.get("source", "UNK"),
-            "score": 80 if t.get("source") == "LIVE" else 50, # Score visuel
-            "risk": "NEW",
+            "score": 85 if t.get("source") == "LIVE_NEW" else 40,
+            "risk": "NEW" if t.get("source") == "LIVE_NEW" else "ESTABLISHED",
             "dex_link": f"https://dexscreener.com/solana/{t.get('address')}"
         })
     
