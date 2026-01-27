@@ -3,23 +3,23 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import time
 import os
-import json
 from typing import List, Dict
 
 app = FastAPI()
 
-# Cache simple
+# Cache pour éviter spam API
 cache: Dict = {"gems": [], "ts": 0}
 CACHE_DURATION = 60  # refresh toutes les 60s
 
-# Clé API Birdeye sécurisée
+# Clé API Birdeye sécurisée via env var Render
 BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
 if not BIRDEYE_KEY:
-    print("ERREUR CRITIQUE : BIRDEYE_KEY non définie dans les variables d'environnement ! Ajoutez-la sur Render.")
+    print("ERREUR CRITIQUE : BIRDEYE_KEY non définie dans les variables d'environnement ! Ajoutez-la sur Render → Environment tab.")
 
 def fetch_new_gems() -> List[Dict]:
     now = time.time()
     if now - cache["ts"] < CACHE_DURATION and cache["gems"]:
+        print("Retour cache (pas de refresh)")
         return cache["gems"]
 
     print("Fetch new gems from Birdeye...")
@@ -29,6 +29,7 @@ def fetch_new_gems() -> List[Dict]:
         "x-chain": "solana"
     }
 
+    tokens = []
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
@@ -36,8 +37,7 @@ def fetch_new_gems() -> List[Dict]:
         tokens = data.get("data", {}).get("items", []) or data.get("data", {}).get("tokens", []) or []
         print(f"Birdeye a renvoyé {len(tokens)} tokens")
     except Exception as e:
-        print(f"Erreur Birdeye API : {str(e)}")
-        tokens = []
+        print(f"Erreur Birdeye API : {str(e)} - Vérifiez la clé ou les limits du plan gratuit")
 
     gems = []
     for t in tokens[:50]:
@@ -46,13 +46,13 @@ def fetch_new_gems() -> List[Dict]:
         volume_24h = t.get("v24hUSD", 0) or t.get("volume24h", 0) or 0
         holders = t.get("holderCount", 0) or t.get("holders", 0)
 
-        # Filtre allégé : low MC + un peu de volume
-        if 10000 < mc < 3000000 and (volume_5m > 1000 or volume_24h > 5000):
+        # Filtre élargi pour voir des résultats : low MC + un minimum de volume
+        if 5000 < mc < 5000000 and (volume_5m > 500 or volume_24h > 2000):
             score = 0
             if mc > 0:
-                score += min(volume_5m / mc * 20, 40)  # spike volume
-            score += min(holders / 100, 20) if holders else 0
-            score += 10  # base pour low MC
+                score += min((volume_5m + volume_24h) / mc * 30, 60)  # spike volume combiné
+            score += min(holders / 200, 25) if holders else 0
+            score += 15  # base low cap
 
             risk = "vert"
             dev_sell = t.get("dev_sell_percent", 0) or 0
@@ -67,17 +67,19 @@ def fetch_new_gems() -> List[Dict]:
                 "symbol": t.get("symbol", "???"),
                 "mc": round(mc / 1000, 1),
                 "volume5m": round(volume_5m / 1000, 1),
+                "volume24h": round(volume_24h / 1000, 1),
                 "holders": holders,
                 "score": round(score),
                 "risk": risk,
                 "dex_link": f"https://dexscreener.com/solana/{t.get('address')}"
             })
 
-    # Tri + limite
+    # Tri descendant + limite 20
     gems = sorted(gems, key=lambda x: x["score"], reverse=True)[:20]
+
     cache["gems"] = gems
     cache["ts"] = now
-    print(f"Retour {len(gems)} gems après filtre")
+    print(f"Retour {len(gems)} gems après filtre (score max : {max([g['score'] for g in gems] or [0])})")
     return gems
 
 @app.get("/")
