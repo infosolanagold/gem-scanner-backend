@@ -13,84 +13,54 @@ app = FastAPI()
 
 # --- CONFIGURATION ---
 BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
-new_tokens = []
+# On stocke les tokens ici
+gem_storage = []
 
-# --- 1. FONCTION INTELLIGENTE (Tente tout pour avoir des données) ---
-def fetch_initial_history():
-    print("⚡ Démarrage : Recherche de données initiales...")
-    
+# --- 1. RÉCUPÉRATION DES "TRENDING" (Vrais Gems + Logos) ---
+def fetch_trending():
+    """Récupère les tokens en tendance (Hot) avec leurs logos"""
+    print("🔥 Mise à jour des Trending Tokens...")
+    url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20"
     headers = {"X-API-KEY": BIRDEYE_KEY, "x-chain": "solana", "accept": "application/json"}
-    found_data = False
-
-    # TENTATIVE A : Les Nouveaux Listings (V2 - La route correcte)
+    
     try:
-        print("👉 Essai 1 : New Listings V2...")
-        # La route V2 officielle qui remplace l'ancienne qui faisait 404
-        url_new = "https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit=10"
-        resp = requests.get(url_new, headers=headers, timeout=5)
-        
+        resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            items = data.get("data", {}).get("items", [])
-            if items:
-                for t in items:
-                    new_tokens.append({
-                        "address": t.get("address"),
-                        "symbol": t.get("symbol", "New"),
-                        "mc": t.get("mc", 0) or t.get("liquidity", 0),
-                        "v24hUSD": t.get("v24hUSD", 0),
-                        "source": "NEW_V2"
-                    })
-                print(f"✅ SUCCÈS : {len(items)} nouveaux listings chargés.")
-                found_data = True
-    except Exception as e:
-        print(f"⚠️ Échec New Listings: {e}")
-
-    # TENTATIVE B : Les Tokens Trending (Si le A est vide ou plante)
-    if not found_data:
-        try:
-            print("👉 Essai 2 : Trending Tokens...")
-            # Endpoint très stable qui renvoie toujours du monde
-            url_trend = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=10"
-            resp = requests.get(url_trend, headers=headers, timeout=5)
+            tokens = data.get("data", {}).get("tokens", [])
             
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("data", {}).get("tokens", [])
-                if items:
-                    for t in items:
-                        new_tokens.append({
-                            "address": t.get("address"),
-                            "symbol": t.get("symbol", "HOT"), # Parfois trending n'a pas le symbole, on met HOT
-                            "mc": t.get("liquidity", 0) * 10, # Estimation grossière MC via Liquidity si manquant
-                            "v24hUSD": t.get("volume24hUSD", 0),
-                            "source": "TRENDING"
-                        })
-                    print(f"✅ SUCCÈS : {len(items)} tokens trending chargés.")
-                    found_data = True
-        except Exception as e:
-            print(f"⚠️ Échec Trending: {e}")
+            # On vide la liste et on remplace par les nouveaux trending
+            global gem_storage
+            temp_list = []
+            
+            for t in tokens:
+                temp_list.append({
+                    "address": t.get("address"),
+                    "symbol": t.get("symbol", "UNK"),
+                    "name": t.get("name", "Unknown"),
+                    "logo": t.get("logoURI"), # LE LOGO EST ICI
+                    "mc": t.get("liquidity", 0) * 10, # Estimation MC
+                    "volume": t.get("volume24hUSD", 0),
+                    "rank": t.get("rank", 999),
+                    "source": "TRENDING"
+                })
+            
+            gem_storage = temp_list
+            print(f"✅ {len(gem_storage)} Gems chargés avec Logos.")
+        else:
+            print(f"⚠️ Erreur Birdeye: {resp.status_code}")
+    except Exception as e:
+        print(f"⚠️ Exception: {e}")
 
-    # TENTATIVE C : Le Filet de Sécurité (Backups)
-    if not found_data or len(new_tokens) == 0:
-        print("🚨 ECHEC TOTAL API -> Injection Backup Manuelle")
-        backups = [
-            {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL", "mc": 70000000000, "v24hUSD": 2000000000},
-            {"address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "symbol": "JUP", "mc": 1200000000, "v24hUSD": 50000000},
-            {"address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "symbol": "BONK", "mc": 1500000000, "v24hUSD": 80000000}
-        ]
-        for b in backups:
-            b["source"] = "BACKUP"
-            new_tokens.append(b)
-
-# --- 2. WEBSOCKET (Reste inchangé car il marchait bien) ---
+# --- 2. WEBSOCKET (Nouveaux listings Live) ---
 async def websocket_listener():
     if not BIRDEYE_KEY: return
     uri = f"wss://public-api.birdeye.so/socket/solana?x-api-key={BIRDEYE_KEY}"
+    
     while True:
         try:
             async with websockets.connect(uri) as ws:
-                print("✅ WS Connecté (Mode Live)")
+                print("✅ WebSocket Live")
                 await ws.send(json.dumps({"type": "subscribe", "event": "SUBSCRIBE_TOKEN_NEW_LISTING"}))
                 while True:
                     try:
@@ -99,43 +69,46 @@ async def websocket_listener():
                         if data.get("type") == "SUBSCRIBE_TOKEN_NEW_LISTING":
                             t = data.get("data", {})
                             if t:
-                                t['source'] = "LIVE_WS"
-                                print(f"💎 LIVE: {t.get('symbol')}")
-                                new_tokens.insert(0, t)
-                                if len(new_tokens) > 50: new_tokens.pop()
+                                # Les nouveaux listings n'ont souvent pas encore de logo, on met une placeholder
+                                gem_storage.insert(0, {
+                                    "address": t.get("address"),
+                                    "symbol": t.get("symbol", "NEW"),
+                                    "name": "New Listing",
+                                    "logo": None, # Pas de logo immédiat
+                                    "mc": t.get("liquidity", 0),
+                                    "volume": 0,
+                                    "source": "LIVE_NEW"
+                                })
+                                # On garde max 50 tokens
+                                if len(gem_storage) > 50: gem_storage.pop()
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"type": "ping"}))
         except Exception:
             await asyncio.sleep(5)
 
+# Tâche de fond pour rafraîchir les trending toutes les 5 minutes
+async def background_refresher():
+    while True:
+        fetch_trending()
+        await asyncio.sleep(300) # 5 minutes
+
 @app.on_event("startup")
 async def startup_event():
-    fetch_initial_history()
-    asyncio.create_task(websocket_listener())
+    fetch_initial_history() # Charge tout de suite
+    asyncio.create_task(websocket_listener()) # Écoute le live
+    asyncio.create_task(background_refresher()) # Met à jour les trending
 
+def fetch_initial_history():
+    fetch_trending()
+
+# --- API ---
 @app.get("/")
 def root():
-    return {"status": "ONLINE", "tokens_loaded": len(new_tokens)}
+    return {"status": "GEMS_API_READY", "count": len(gem_storage)}
 
 @app.get("/api/gems")
 def get_gems():
-    gems = []
-    # On protège la lecture de la liste
-    current_list = list(new_tokens)
-    
-    for t in current_list[:20]:
-        mc = t.get("mc", 0) or 0
-        gems.append({
-            "address": t.get("address", ""),
-            "symbol": t.get("symbol", "???"),
-            "mc": round(mc, 2),
-            "volume": round(t.get("v24hUSD", 0), 2),
-            "score": 95 if t.get("source") == "LIVE_WS" else 60,
-            "risk": "NEW" if t.get("source") == "LIVE_WS" else "TRUSTED",
-            "dex_link": f"https://dexscreener.com/solana/{t.get('address')}"
-        })
-    
-    return {"gems": gems, "count": len(gems), "updated": time.strftime("%H:%M:%S")}
+    return {"gems": gem_storage, "count": len(gem_storage), "updated": time.strftime("%H:%M:%S")}
 
 app.add_middleware(
     CORSMiddleware,
