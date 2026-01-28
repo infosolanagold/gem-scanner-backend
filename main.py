@@ -13,13 +13,13 @@ app = FastAPI()
 
 # --- CONFIGURATION ---
 BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
-# On stocke les tokens ici
 gem_storage = []
 
-# --- 1. RÉCUPÉRATION DES "TRENDING" (Vrais Gems + Logos) ---
+# --- 1. RÉCUPÉRATION DES GEMS (TRENDING) ---
 def fetch_trending():
-    """Récupère les tokens en tendance (Hot) avec leurs logos"""
+    """Récupère les tokens chauds AVEC LOGOS"""
     print("🔥 Mise à jour des Trending Tokens...")
+    # On utilise l'endpoint trending qui fournit les logos (logoURI)
     url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20"
     headers = {"X-API-KEY": BIRDEYE_KEY, "x-chain": "solana", "accept": "application/json"}
     
@@ -29,7 +29,7 @@ def fetch_trending():
             data = resp.json()
             tokens = data.get("data", {}).get("tokens", [])
             
-            # On vide la liste et on remplace par les nouveaux trending
+            # On vide et on remplit
             global gem_storage
             temp_list = []
             
@@ -38,21 +38,25 @@ def fetch_trending():
                     "address": t.get("address"),
                     "symbol": t.get("symbol", "UNK"),
                     "name": t.get("name", "Unknown"),
-                    "logo": t.get("logoURI"), # LE LOGO EST ICI
-                    "mc": t.get("liquidity", 0) * 10, # Estimation MC
+                    # ICI C'EST IMPORTANT : On chope le logo
+                    "logo": t.get("logoURI"), 
+                    "mc": t.get("liquidity", 0) * 10,
                     "volume": t.get("volume24hUSD", 0),
                     "rank": t.get("rank", 999),
                     "source": "TRENDING"
                 })
             
-            gem_storage = temp_list
-            print(f"✅ {len(gem_storage)} Gems chargés avec Logos.")
+            if len(temp_list) > 0:
+                gem_storage = temp_list
+                print(f"✅ {len(gem_storage)} Gems chargés avec Logos.")
+            else:
+                print("⚠️ Liste trending vide reçue.")
         else:
             print(f"⚠️ Erreur Birdeye: {resp.status_code}")
     except Exception as e:
         print(f"⚠️ Exception: {e}")
 
-# --- 2. WEBSOCKET (Nouveaux listings Live) ---
+# --- 2. WEBSOCKET (LIVE) ---
 async def websocket_listener():
     if not BIRDEYE_KEY: return
     uri = f"wss://public-api.birdeye.so/socket/solana?x-api-key={BIRDEYE_KEY}"
@@ -69,39 +73,33 @@ async def websocket_listener():
                         if data.get("type") == "SUBSCRIBE_TOKEN_NEW_LISTING":
                             t = data.get("data", {})
                             if t:
-                                # Les nouveaux listings n'ont souvent pas encore de logo, on met une placeholder
+                                # Les nouveaux n'ont souvent pas de logo, on met None
                                 gem_storage.insert(0, {
                                     "address": t.get("address"),
                                     "symbol": t.get("symbol", "NEW"),
                                     "name": "New Listing",
-                                    "logo": None, # Pas de logo immédiat
+                                    "logo": None, 
                                     "mc": t.get("liquidity", 0),
                                     "volume": 0,
                                     "source": "LIVE_NEW"
                                 })
-                                # On garde max 50 tokens
                                 if len(gem_storage) > 50: gem_storage.pop()
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"type": "ping"}))
         except Exception:
             await asyncio.sleep(5)
 
-# Tâche de fond pour rafraîchir les trending toutes les 5 minutes
 async def background_refresher():
     while True:
         fetch_trending()
-        await asyncio.sleep(300) # 5 minutes
+        await asyncio.sleep(300) # Refresh toutes les 5 min
 
 @app.on_event("startup")
 async def startup_event():
-    fetch_initial_history() # Charge tout de suite
-    asyncio.create_task(websocket_listener()) # Écoute le live
-    asyncio.create_task(background_refresher()) # Met à jour les trending
-
-def fetch_initial_history():
     fetch_trending()
+    asyncio.create_task(websocket_listener())
+    asyncio.create_task(background_refresher())
 
-# --- API ---
 @app.get("/")
 def root():
     return {"status": "GEMS_API_READY", "count": len(gem_storage)}
