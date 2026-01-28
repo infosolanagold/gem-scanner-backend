@@ -5,106 +5,116 @@ import time
 import os
 import asyncio
 import websockets
-from typing import List, Dict
 import json
+from typing import List, Dict
 import uvicorn
+from collections import defaultdict
 
-app = FastAPI()
+app = FastAPI(title="Solana Gold Gem Scanner")
 
-# --- CONFIGURATION ---
+# Config
 BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
-new_tokens = []
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/search?q=solana"
+MAX_TOKENS = 100  # limite mémoire
 
-# --- 1. HISTORIQUE VIA DEXSCREENER (Beaucoup plus vivant) ---
+# Stockage (set pour éviter doublons address)
+new_tokens = []  # list pour ordre chronologique
+seen_addresses = set()  # pour éviter doublons
+
+# --- 1. Chargement initial via DexScreener (tokens actifs Solana) ---
 def fetch_initial_history():
-    """Charge des vrais tokens actifs depuis DexScreener pour remplir le tableau"""
-    print("⚡ Démarrage : Récupération des tokens actifs via DexScreener...")
-    
+    print("⚡ Chargement historique DexScreener...")
     try:
-        # On cherche les paires Solana actives
-        url = "https://api.dexscreener.com/latest/dex/search?q=solana"
-        resp = requests.get(url, timeout=5)
-        
+        resp = requests.get(DEXSCREENER_URL, timeout=8)
         if resp.status_code == 200:
             pairs = resp.json().get("pairs", [])
-            count = 0
-            
-            # On prend les 20 premiers résultats pertinents
+            added = 0
             for p in pairs:
-                if p.get("chainId") == "solana" and count < 20:
-                    new_tokens.append({
-                        "address": p.get("baseToken", {}).get("address"),
-                        "symbol": p.get("baseToken", {}).get("symbol", "UNK"),
-                        "mc": p.get("fdv", 0), # MarketCap
-                        "v24hUSD": p.get("volume", {}).get("h24", 0),
-                        "source": "TRENDING", # Marqué comme Trending
-                        "dex_link": p.get("url")
-                    })
-                    count += 1
-            print(f"✅ DexScreener : {count} tokens chargés.")
+                if p.get("chainId") == "solana" and added < 30:
+                    addr = p.get("baseToken", {}).get("address")
+                    if addr and addr not in seen_addresses:
+                        seen_addresses.add(addr)
+                        new_tokens.append({
+                            "address": addr,
+                            "symbol": p.get("baseToken", {}).get("symbol", "???"),
+                            "mc": p.get("fdv", 0),
+                            "volume": p.get("volume", {}).get("h24", 0),
+                            "liquidity": p.get("liquidity", {}).get("usd", 0),
+                            "txns": p.get("txns", {}).get("h24", {}).get("buys", 0) + p.get("txns", {}).get("h24", {}).get("sells", 0),
+                            "source": "TRENDING",
+                            "dex_link": p.get("url", f"https://dexscreener.com/solana/{addr}")
+                        })
+                        added += 1
+            print(f"✅ DexScreener : {added} tokens chargés")
         else:
-            print("⚠️ DexScreener n'a pas répondu.")
-
+            print(f"⚠️ DexScreener status {resp.status_code}")
     except Exception as e:
-        print(f"⚠️ Erreur chargement DexScreener: {e}")
+        print(f"⚠️ Erreur DexScreener : {e}")
 
-    # Si vraiment DexScreener plante, on met UN seul backup pour pas que ce soit vide
-    if len(new_tokens) == 0:
+    # Fallback minimal si zéro
+    if not new_tokens:
+        print("⚠️ Pas de data DexScreener → fallback mock")
         new_tokens.append({
-            "address": "So11111111111111111111111111111111111111112", 
-            "symbol": "SYSTEM_READY", 
-            "mc": 0, 
-            "v24hUSD": 0, 
-            "source": "WAITING"
+            "address": "So11111111111111111111111111111111111111112",
+            "symbol": "READY",
+            "mc": 0,
+            "volume": 0,
+            "source": "SYSTEM",
+            "dex_link": "#"
         })
 
-# --- 2. WEBSOCKET BIRDEYE (POUR LE LIVE) ---
+# --- 2. WebSocket Birdeye pour real-time new listings ---
 async def websocket_listener():
     if not BIRDEYE_KEY:
-        print("❌ Clé Birdeye manquante pour le WebSocket")
+        print("❌ Pas de clé Birdeye → WS désactivé")
         return
 
     uri = f"wss://public-api.birdeye.so/socket/solana?x-api-key={BIRDEYE_KEY}"
-    
+    reconnect_delay = 5
+
     while True:
         try:
-            print("🔄 Connexion WebSocket...")
-            async with websockets.connect(uri) as ws:
-                print("✅ WS Connecté : En attente de Nouveaux Listings...")
+            print(f"🔄 Connexion WS Birdeye (delay {reconnect_delay}s)...")
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
+                print("✅ WS connecté")
                 await ws.send(json.dumps({"type": "subscribe", "event": "SUBSCRIBE_TOKEN_NEW_LISTING"}))
-                
+                print("Subscribed to SUBSCRIBE_TOKEN_NEW_LISTING")
+
                 while True:
                     try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=20)
+                        msg = await asyncio.wait_for(ws.recv(), timeout=30)
                         data = json.loads(msg)
-                        
                         if data.get("type") == "SUBSCRIBE_TOKEN_NEW_LISTING":
                             t = data.get("data", {})
-                            if t:
-                                # On nettoie les données entrantes
-                                token_live = {
-                                    "address": t.get("address"),
+                            addr = t.get("address")
+                            if addr and addr not in seen_addresses:
+                                seen_addresses.add(addr)
+                                token = {
+                                    "address": addr,
                                     "symbol": t.get("symbol", "NEW"),
-                                    "mc": t.get("mc", 0) or t.get("fdv", 0) or 0,
-                                    "v24hUSD": t.get("v24hUSD", 0),
-                                    "source": "LIVE_WS", # Marqué comme NOUVEAU
-                                    "dex_link": f"https://dexscreener.com/solana/{t.get('address')}"
+                                    "mc": t.get("mc", 0) or t.get("fdv", 0),
+                                    "volume": t.get("v24hUSD", 0),
+                                    "source": "LIVE_WS",
+                                    "dex_link": f"https://dexscreener.com/solana/{addr}"
                                 }
-                                print(f"💎 LIVE DETECTED: {token_live['symbol']}")
-                                new_tokens.insert(0, token_live) # Ajoute tout en haut
-                                if len(new_tokens) > 50: new_tokens.pop()
-                                
+                                new_tokens.insert(0, token)
+                                if len(new_tokens) > MAX_TOKENS:
+                                    old = new_tokens.pop()
+                                    seen_addresses.discard(old["address"])
+                                print(f"💎 NEW LIVE : {token['symbol']} | MC {token['mc']}")
                     except asyncio.TimeoutError:
-                        await ws.send(json.dumps({"type": "ping"}))
-                        
+                        await ws.ping()
         except Exception as e:
-            print(f"❌ Erreur WS (Reconnexion...): {e}")
-            await asyncio.sleep(5)
+            print(f"❌ WS error : {str(e)}. Reconnect in {reconnect_delay}s")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 60)  # backoff max 60s
 
-@app.on_event("startup")
+# Startup : charge historique + lance WS
 async def startup_event():
     fetch_initial_history()
     asyncio.create_task(websocket_listener())
+
+app.add_event_handler("startup", startup_event)
 
 @app.get("/")
 def root():
@@ -113,28 +123,31 @@ def root():
 @app.get("/api/gems")
 def get_gems():
     gems = []
-    # Copie pour éviter les conflits pendant la boucle
-    for t in list(new_tokens)[:25]:
-        
-        # Calcul du score dynamique
-        score = 50 # Base
-        if t.get("source") == "LIVE_WS": score = 95 # Les nouveaux sont Hot
-        elif t.get("source") == "TRENDING": score = 75 # Les trending sont bons
-        
-        # Ajustement Market Cap pour l'affichage
+    # Derniers 25 (les plus récents en haut)
+    for t in new_tokens[:25]:
+        score = 50
+        if t["source"] == "LIVE_WS":
+            score = 95
+        elif t["source"] == "TRENDING":
+            score = 75
+
         mc = t.get("mc", 0)
-        
+        volume = t.get("volume", 0)
+        if volume > 0 and mc > 0:
+            score += min(volume / mc * 20, 40)
+
         gems.append({
-            "address": t.get("address", ""),
-            "symbol": t.get("symbol", "???"),
+            "address": t["address"],
+            "symbol": t["symbol"],
             "mc": round(mc, 2),
-            "volume": round(t.get("v24hUSD", 0), 2),
+            "volume": round(volume, 2),
             "score": score,
-            "risk": "NEW" if t.get("source") == "LIVE_WS" else "TRENDING",
-            "dex_link": t.get("dex_link", "#")
+            "risk": "NEW" if t["source"] == "LIVE_WS" else "TRENDING",
+            "dex_link": t["dex_link"],
+            "source": t["source"]
         })
-    
-    return {"gems": gems, "count": len(gems), "updated": time.strftime("%H:%M:%S")}
+
+    return {"gems": gems, "count": len(gems), "updated": time.strftime("%H:%M:%S UTC")}
 
 app.add_middleware(
     CORSMiddleware,
