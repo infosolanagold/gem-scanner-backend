@@ -1,0 +1,19 @@
+{
+  "name": "sgold-backend",
+  "version": "1.0.0",
+  "description": "Backend Node.js pour Solana Gold",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.13.0",
+    "axios": "^1.4.0",
+    "cors": "^2.8.5",
+    "@solana/web3.js": "^1.78.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
